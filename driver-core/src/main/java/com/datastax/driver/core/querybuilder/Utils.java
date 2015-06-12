@@ -22,6 +22,10 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.regex.Pattern;
 
+import com.google.common.collect.Sets;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+
 import com.datastax.driver.core.DataType;
 import com.datastax.driver.core.utils.Bytes;
 
@@ -30,6 +34,7 @@ abstract class Utils {
 
     private static final Pattern cnamePattern = Pattern.compile("\\w+(?:\\[.+\\])?");
 
+    private static final Set<String> nonIdempotentFunctions = Sets.newHashSet("now()", "uuid()");
 
     static StringBuilder joinAndAppend(StringBuilder sb, String separator, List<? extends Appendeable> values, List<ByteBuffer> variables) {
         for (int i = 0; i < values.size(); i++) {
@@ -247,6 +252,28 @@ abstract class Utils {
         return false;
     }
 
+    static boolean isIdempotent(Object value) {
+        if(value == null) {
+            return true;
+        } else if (value instanceof Assignment) {
+            Assignment assignment = (Assignment)value;
+            return assignment.isIdempotent();
+        } else if (value instanceof Utils.FCall) {
+            Utils.FCall fCall = (Utils.FCall)value;
+            return fCall.isIdempotent();
+        } else if (value instanceof RawString) {
+            RawString raw = (RawString)value;
+            return isIdempotent(raw.str);
+        } else {
+            String str = value.toString().toLowerCase();
+            for (String function : nonIdempotentFunctions) {
+                if (str.contains(function))
+                    return false;
+            }
+            return true;
+        }
+    }
+
     private static StringBuilder appendMap(Map<?, ?> m, StringBuilder sb, boolean rawValue) {
         sb.append('{');
         boolean first = true;
@@ -363,12 +390,31 @@ abstract class Utils {
     }
 
     static class FCall {
+
         private final String name;
+        private final boolean idempotent;
         private final Object[] parameters;
 
         FCall(String name, Object... parameters) {
+            checkNotNull(name);
             this.name = name;
             this.parameters = parameters;
+            boolean idempotent = Utils.isIdempotent(name + "()");
+            if (idempotent) {
+                for (Object parameter : parameters) {
+                    idempotent = Utils.isIdempotent(parameter);
+                    if (!idempotent)
+                        break;
+                }
+            }
+            this.idempotent = idempotent;
+        }
+
+        public FCall(boolean idempotent, String name, Object... parameters) {
+            checkNotNull(name);
+            this.name = name;
+            this.parameters = parameters;
+            this.idempotent = idempotent;
         }
 
         @Override
@@ -382,6 +428,10 @@ abstract class Utils {
             }
             sb.append(')');
             return sb.toString();
+        }
+
+        public boolean isIdempotent() {
+            return idempotent;
         }
     }
 

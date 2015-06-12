@@ -926,6 +926,10 @@ public final class QueryBuilder {
 
     /**
      * Creates a function call.
+     * <p>
+     * The function call will be considered idempotent, except if it is a call
+     * to a built-in function that is known to be non-idempotent,
+     * such as {@code uuid()} or {@code now()}.
      *
      * @param name the name of the function to call.
      * @param parameters the parameters for the function.
@@ -933,6 +937,36 @@ public final class QueryBuilder {
      */
     public static Object fcall(String name, Object... parameters) {
         return new Utils.FCall(name, parameters);
+    }
+
+    /**
+     * Creates a function call.
+     *
+     * @param idempotent {@code true} if the function is idempotent, {@code false} otherwise
+     * @param name the name of the function to call.
+     * @param parameters the parameters for the function.
+     * @return the function call.
+     */
+    public static Object fcall(boolean idempotent, String name, Object... parameters) {
+        return new Utils.FCall(idempotent, name, parameters);
+    }
+
+    /**
+     * Creates a {@code now()} function call.
+     *
+     * @return the function call.
+     */
+    public static Object now() {
+        return new Utils.FCall("now");
+    }
+
+    /**
+     * Creates a {@code uuid()} function call.
+     *
+     * @return the function call.
+     */
+    public static Object uuid() {
+        return new Utils.FCall("uuid");
     }
 
     /**

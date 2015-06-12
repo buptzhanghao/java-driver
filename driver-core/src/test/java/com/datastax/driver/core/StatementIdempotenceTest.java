@@ -16,6 +16,9 @@
 package com.datastax.driver.core;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import org.testng.annotations.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -86,18 +89,62 @@ public class StatementIdempotenceTest {
     }
 
     private static ImmutableList<BuiltStatement> idempotentBuiltStatements() {
-        return ImmutableList.<BuiltStatement>of(
+        return ImmutableList.of(
             update("foo").with(set("v", 1)).where(eq("k", 1)), // set simple value
             update("foo").with(add("s", 1)).where(eq("k", 1)), // add to set
-            update("foo").with(put("m", "a", 1)).where(eq("k", 1)) // put in map
+            update("foo").with(put("m", "a", 1)).where(eq("k", 1)), // put in map
+
+            // idempotent function calls
+
+            insertInto("foo").value("k", 1).value("v", fcall("token", "k")),
+            insertInto("foo").value("k", 1).value("v", fcall(true, "foo")),
+            insertInto("foo").value("k", 1).value("v", raw("foo()")),
+            update("foo").with(set("v", fcall("token", "k"))).where(eq("k", 1)),
+            update("foo").with(set("v", fcall(true, "foo"))).where(eq("k", 1)),
+            update("foo").with(set("v", raw("foo()"))).where(eq("k", 1))
+
         );
     }
 
     private static ImmutableList<BuiltStatement> nonIdempotentBuiltStatements() {
-        return ImmutableList.<BuiltStatement>of(
+        return ImmutableList.of(
             update("foo").with(append("l", 1)).where(eq("k", 1)), // append to list
             update("foo").with(set("v", 1)).and(prepend("l", 1)).where(eq("k", 1)), // prepend to list
-            update("foo").with(incr("c")).where(eq("k", 1)) // counter update
+            update("foo").with(incr("c")).where(eq("k", 1)), // counter update
+
+            // non-idempotent function calls
+
+            update("foo").with(set("v", fcall("NOW"))).where(eq("k", 1)),
+            update("foo").with(set("v", fcall("UUID"))).where(eq("k", 2)),
+            update("foo").with(set("v", fcall(false, "foo"))).where(eq("k", 3)),
+            update("foo").with(set("v", raw("NOW()"))).where(eq("k", 4)),
+            update("foo").with(set("v", raw("UUID()"))).where(eq("k", 5)),
+            update("foo").with(set("v", now())).where(eq("k", 6)),
+            update("foo").with(set("v", uuid())).where(eq("k", 7)),
+            update("foo").with(set("v", fcall("foo", now()))).where(eq("k", 8)), // nested now()
+            update("foo").with(set("v", Lists.newArrayList(fcall("foo", now())))).where(eq("k", 8)), // list with nested now()
+
+            insertInto("foo").value("k", 9).value("v", fcall("NOW")),
+            insertInto("foo").value("k", 10).value("v", fcall("UUID")),
+            insertInto("foo").value("k", 11).value("v", fcall(false, "foo")),
+            insertInto("foo").value("k", 12).value("v", raw("NOW()")),
+            insertInto("foo").value("k", 13).value("v", raw("UUID()")),
+            insertInto("foo").value("k", 14).value("v", now()),
+            insertInto("foo").value("k", 15).value("v", uuid()),
+            insertInto("foo").value("k", 16).value("v", fcall("foo", uuid())), // nested uuid()
+            insertInto("foo").value("v", Sets.newHashSet(fcall("foo", uuid()))), // set with nest uuid()
+
+
+            insertInto("foo").values(new String[]{"k", "v"}, new Object[]{17, fcall("NOW")}),
+            insertInto("foo").values(new String[]{"k", "v"}, new Object[]{18, fcall("UUID")}),
+            insertInto("foo").values(new String[]{"k", "v"}, new Object[]{19, fcall(false, "foo")}),
+            insertInto("foo").values(new String[]{"k", "v"}, new Object[]{20, raw("NOW()")}),
+            insertInto("foo").values(new String[]{"k", "v"}, new Object[]{21, raw("UUID()")}),
+            insertInto("foo").values(new String[]{"k", "v"}, new Object[]{22, now()}),
+            insertInto("foo").values(new String[]{"k", "v"}, new Object[]{23, uuid()}),
+            insertInto("foo").values(new String[]{"k", "v"}, new Object[]{24, fcall("foo", uuid())}),
+            insertInto("foo").values(new String[]{"k", "v"}, new Object[]{24, ImmutableMap.of("foo", fcall("foo", uuid()))}) // map with nested uuid()
+
         );
     }
 }
