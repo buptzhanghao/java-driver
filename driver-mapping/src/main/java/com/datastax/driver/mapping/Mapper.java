@@ -19,7 +19,7 @@ import java.util.*;
 
 import com.google.common.base.Function;
 import com.google.common.base.Functions;
-import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import org.slf4j.Logger;
@@ -32,7 +32,7 @@ import com.datastax.driver.core.querybuilder.QueryBuilder;
 
 /**
  * An object handling the mapping of a particular class.
- * <p>
+ * <p/>
  * A {@code Mapper} object is obtained from a {@code MappingManager} using the
  * {@link MappingManager#mapper} method.
  */
@@ -51,8 +51,9 @@ public class Mapper<T> {
 
     private static final Function<Object, Void> NOOP = Functions.<Void>constant(null);
 
-    private volatile Option[] defaultSaveOptions;
-    private volatile Option[] defaultDeleteOptions;
+    private volatile Set<Option> defaultSaveOptions;
+    private volatile Set<Option> defaultGetOptions;
+    private volatile Set<Option> defaultDeleteOptions;
 
     final Function<ResultSet, T> mapOneFunction;
     final Function<ResultSet, Result<T>> mapAllFunction;
@@ -76,13 +77,17 @@ public class Mapper<T> {
                 return Mapper.this.map(rs);
             }
         };
+
+        this.defaultSaveOptions = Collections.<Option>emptySet();
+        this.defaultGetOptions = Collections.<Option>emptySet();
+        this.defaultDeleteOptions = Collections.<Option>emptySet();
     }
 
     Session session() {
         return manager.getSession();
     }
 
-    PreparedStatement getPreparedQuery(QueryType type, Option... options) {
+    PreparedStatement getPreparedQuery(QueryType type, Set<Option> options) {
 
         MapperQueryKey pqk = new MapperQueryKey(type, options);
 
@@ -123,7 +128,7 @@ public class Mapper<T> {
 
     /**
      * Creates a query that can be used to save the provided entity.
-     * <p>
+     * <p/>
      * This method is useful if you want to setup a number of options (tracing,
      * conistency level, ...) of the returned statement before executing it manually
      * or need access to the {@code ResultSet} object after execution (to get the
@@ -139,33 +144,41 @@ public class Mapper<T> {
 
     /**
      * Creates a query that can be used to save the provided entity.
-     * <p>
+     * <p/>
      * This method is useful if you want to setup a number of options (tracing,
      * conistency level, ...) of the returned statement before executing it manually
      * or need access to the {@code ResultSet} object after execution (to get the
      * trace, the execution info, ...), but in other cases, calling {@link #save}
      * or {@link #saveAsync} is shorter.
+     * This method allows you to provide a suite of {@link Option} to include in
+     * the SAVE query. Options currently supported for SAVE are :
+     * <ul>
+     * <li>Timestamp</li>
+     * <li>Time-to-live (ttl)</li>
+     * <li>Consistency level</li>
+     * <li>Tracing</li>
+     * </ul>
      *
      * @param entity the entity to save.
      * @return a query that saves {@code entity} (based on it's defined mapping).
      */
     public Statement saveQuery(T entity, Option... options) {
-        PreparedStatement ps = getPreparedQuery(QueryType.SAVE, options);
+        return saveQuery(entity, ImmutableSet.<Option>copyOf(options));
+    }
 
-        BoundStatement bs = ps.bind();
+    private Statement saveQuery(T entity, Set<Option> options) {
+        BoundStatement bs = getPreparedQuery(QueryType.SAVE, options).bind();
         int i = 0;
         for (ColumnMapper<T> cm : mapper.allColumns()) {
             Object value = cm.getValue(entity);
             bs.setBytesUnsafe(i++, value == null ? null : cm.getDataType().serialize(value, protocolVersion));
         }
 
-        if (options != null) {
-            for (Option opt : options){
-                if (opt.isValidFor(QueryType.SAVE)){
-                    opt.bindInStatement(bs, i++);
-                }
-            }
+        for (Option opt : options) {
+            if (opt.isValidFor(QueryType.SAVE))
+                opt.addToPreparedStatement(bs, i++);
         }
+
         if (mapper.writeConsistency != null)
             bs.setConsistencyLevel(mapper.writeConsistency);
         return bs;
@@ -173,7 +186,7 @@ public class Mapper<T> {
 
     /**
      * Save an entity mapped by this mapper.
-     * <p>
+     * <p/>
      * This method is basically equivalent to: {@code getManager().getSession().execute(saveQuery(entity))}.
      *
      * @param entity the entity to save.
@@ -184,18 +197,26 @@ public class Mapper<T> {
 
     /**
      * Save an entity mapped by this mapper and using special options for save.
-     * <p>
+     * This method allows you to provide a suite of {@link Option} to include in
+     * the SAVE query. Options currently supported for SAVE are :
+     * <ul>
+     * <li>Timestamp</li>
+     * <li>Time-to-live (ttl)</li>
+     * <li>Consistency level</li>
+     * <li>Tracing</li>
+     * </ul>
+     * <p/>
      *
      * @param entity  the entity to save.
      * @param options the options object specified defining special options when saving.
      */
     public void save(T entity, Option... options) {
-        session().execute(saveQuery(entity, options));
+        session().execute(saveQuery(entity, ImmutableSet.copyOf(options)));
     }
 
     /**
      * Save an entity mapped by this mapper asynchonously.
-     * <p>
+     * <p/>
      * This method is basically equivalent to: {@code getManager().getSession().executeAsync(saveQuery(entity))}.
      *
      * @param entity the entity to save.
@@ -206,30 +227,155 @@ public class Mapper<T> {
     }
 
     /**
-     * Save an entity mapped by this mapper asynchonously and using special options for save.
-     * <p>
+     * Save an entity mapped by this mapper asynchonously using special options for save.
+     * <p/>
+     * This method is basically equivalent to: {@code getManager().getSession().executeAsync(saveQuery(entity, options))}.
      *
-     * @param entity the entity to save.
+     * @param entity  the entity to save.
+     * @param options the options object specified defining special options when saving.
      * @return a future on the completion of the save operation.
      */
     public ListenableFuture<Void> saveAsync(T entity, Option... options) {
-        return Futures.transform(session().executeAsync(saveQuery(entity, options)), NOOP);
+        return Futures.transform(session().executeAsync(saveQuery(entity, ImmutableSet.copyOf(options))), NOOP);
+    }
+
+    /**
+     * Creates a query to fetch entity given its PRIMARY KEY.
+     * <p/>
+     * The values provided must correspond to the columns composing the PRIMARY
+     * KEY (in the order of said primary key).
+     * <p/>
+     * This method is useful if you want to setup a number of options (tracing,
+     * conistency level, ...) of the returned statement before executing it manually,
+     * but in other cases, calling {@link #get} or {@link #getAsync} is shorter.
+     * <p/>
+     * This method allows you to provide a suite of {@link Option} to include in
+     * the GET query. Options currently supported for GET are :
+     * <ul>
+     * <li>Consistency level</li>
+     * <li>Tracing</li>
+     * </ul>
+     *
+     * @param objects the primary key of the entity to fetch, or more precisely
+     *                the values for the columns of said primary key in the order of the primary key.
+     *                Can be followed by {@link Option} to include in the DELETE query.
+     * @return a query that fetch the entity of PRIMARY KEY {@code objects}.
+     * @throws IllegalArgumentException if the number of value provided differ from
+     *                                  the number of columns composing the PRIMARY KEY of the mapped class, or if
+     *                                  at least one of those values is {@code null}.
+     */
+    public Statement getQuery(Object... objects) {
+        // Order and duplicates matter for primary keys
+        List<Object> pks = new ArrayList<Object>();
+        Set<Option> options = new HashSet<Option>();
+        for (Object o : objects) {
+            if (o instanceof Option) {
+                options.add((Option)o);
+            } else {
+                pks.add(o);
+            }
+        }
+        return getQuery(pks, options);
+    }
+
+    private Statement getQuery(List<Object> primaryKeys, Set<Option> options) {
+
+        if (primaryKeys.size() != mapper.primaryKeySize())
+            throw new IllegalArgumentException(String.format("Invalid number of PRIMARY KEY columns provided, %d expected but got %d", mapper.primaryKeySize(), primaryKeys.size()));
+
+        // Options are not useful to prepare a GET query for now, with the existing options.
+        // So they will be ignored in #getPreparedQuery() but I add them to the call in case
+        // we need to add new options that would be included in the prepared query.
+        // So to code a new Option, we only need to write the class and write isValidFor() consequently.
+        Set<Option> toUseOptions;
+        if (options.size() != 0) {
+            toUseOptions = options;
+        } else {
+            toUseOptions = this.defaultGetOptions;
+        }
+
+        // Since currently no options are to be included in GET queries,
+        // this will always be empty for now.
+        BoundStatement bs = getPreparedQuery(QueryType.GET, toUseOptions).bind();
+        int i = 0;
+        for (Object value : primaryKeys) {
+            ColumnMapper<T> column = mapper.getPrimaryKeyColumn(i);
+            if (value == null) {
+                throw new IllegalArgumentException(String.format("Invalid null value for PRIMARY KEY column %s (argument %d)", column.getColumnName(), i));
+            }
+            bs.setBytesUnsafe(i, column.getDataType().serialize(value, protocolVersion));
+            i++;
+        }
+
+        for (Option opt : toUseOptions) {
+            if (opt.isValidFor(QueryType.GET))
+                opt.addToPreparedStatement(bs, i++);
+        }
+
+        if (mapper.readConsistency != null)
+            bs.setConsistencyLevel(mapper.readConsistency);
+        return bs;
+    }
+
+    /**
+     * Fetch an entity based on its primary key.
+     * <p/>
+     * This method is basically equivalent to: {@code map(getManager().getSession().execute(getQuery(objects))).one()}.
+     * <p/>
+     *
+     * @param objects the primary key of the entity to fetch, or more precisely
+     *                the values for the columns of said primary key in the order of the primary key.
+     *                Can be followed by {@link Option} to include in the DELETE query.
+     * @return the entity fetched or {@code null} if it doesn't exist.
+     * @throws IllegalArgumentException if the number of value provided differ from
+     *                                  the number of columns composing the PRIMARY KEY of the mapped class, or if
+     *                                  at least one of those values is {@code null}.
+     */
+    public T get(Object... objects) {
+        return map(session().execute(getQuery(objects))).one();
+    }
+
+    /**
+     * Fetch an entity based on its primary key asynchronously.
+     * <p/>
+     * This method is basically equivalent to mapping the result of: {@code getManager().getSession().executeAsync(getQuery(objects))}.
+     * <p/>
+     *
+     * @param objects the primary key of the entity to fetch, or more precisely
+     *                the values for the columns of said primary key in the order of the primary key.
+     *                Can be followed by {@link Option} to include in the DELETE query.
+     * @return a future on the fetched entity. The return future will yield
+     * {@code null} if said entity doesn't exist.
+     * @throws IllegalArgumentException if the number of value provided differ from
+     *                                  the number of columns composing the PRIMARY KEY of the mapped class, or if
+     *                                  at least one of those values is {@code null}.
+     */
+    public ListenableFuture<T> getAsync(Object... objects) {
+        return Futures.transform(session().executeAsync(getQuery(objects)), mapOneFunction);
     }
 
     /**
      * Creates a query that can be used to delete the provided entity.
-     * <p>
+     * <p/>
      * This method is a shortcut that extract the PRIMARY KEY from the
      * provided entity and call {@link #deleteQuery(Object...)} with it.
      * This method allows you to provide a suite of {@link Option} to include in
      * the DELETE query. Note : currently, only {@link com.datastax.driver.mapping.Mapper.Option.Timestamp}
      * is supported for DELETE queries.
-     * <p>
+     * <p/>
      * This method is useful if you want to setup a number of options (tracing,
      * conistency level, ...) of the returned statement before executing it manually
      * or need access to the {@code ResultSet} object after execution (to get the
      * trace, the execution info, ...), but in other cases, calling {@link #delete}
      * or {@link #deleteAsync} is shorter.
+     * <p/>
+     * This method allows you to provide a suite of {@link Option} to include in
+     * the DELETE query. Options currently supported for DELETE are :
+     * <ul>
+     * <li>Timestamp</li>
+     * <li>Consistency level</li>
+     * <li>Tracing</li>
+     * </ul>
      *
      * @param entity  the entity to delete.
      * @param options the options to add to the DELETE query.
@@ -237,19 +383,20 @@ public class Mapper<T> {
      * provided USING options.
      */
     public Statement deleteQuery(T entity, Option... options) {
-        Object[] pks = new Object[mapper.primaryKeySize()];
-        for (int i = 0; i < pks.length; i++)
-            pks[i] = mapper.getPrimaryKeyColumn(i).getValue(entity);
+        List<Object> pks = new ArrayList<Object>();
+        for (int i = 0; i < mapper.primaryKeySize(); i++) {
+            pks.add(mapper.getPrimaryKeyColumn(i).getValue(entity));
+        }
 
-        return deleteQuery(pks, Arrays.asList(options));
+        return deleteQuery(pks, ImmutableSet.copyOf(options));
     }
 
     /**
      * Creates a query that can be used to delete the provided entity.
-     * <p>
+     * <p/>
      * This method is a shortcut that extract the PRIMARY KEY from the
      * provided entity and call {@link #deleteQuery(Object...)} with it.
-     * <p>
+     * <p/>
      * This method is useful if you want to setup a number of options (tracing,
      * conistency level, ...) of the returned statement before executing it manually
      * or need access to the {@code ResultSet} object after execution (to get the
@@ -260,76 +407,87 @@ public class Mapper<T> {
      * @return a query that delete {@code entity} (based on it's defined mapping).
      */
     public Statement deleteQuery(T entity) {
-        Object[] pks = new Object[mapper.primaryKeySize()];
-        for (int i = 0; i < pks.length; i++)
-            pks[i] = mapper.getPrimaryKeyColumn(i).getValue(entity);
+        List<Object> pks = new ArrayList<Object>();
+        for (int i = 0; i < mapper.primaryKeySize(); i++) {
+            pks.add(mapper.getPrimaryKeyColumn(i).getValue(entity));
+        }
 
-        return deleteQuery(pks);
+        return deleteQuery(pks, Collections.<Option>emptySet());
     }
 
     /**
      * Creates a query that can be used to delete an entity given its PRIMARY KEY.
-     * <p>
+     * <p/>
      * The values provided must correspond to the columns composing the PRIMARY
      * KEY (in the order of said primary key). The values can also contain, after
      * specifying the primary keys columns, a suite of {@link Option} to include in
      * the DELETE query. Note : currently, only {@link com.datastax.driver.mapping.Mapper.Option.Timestamp}
      * is supported for DELETE queries.
-     * <p>
+     * <p/>
      * This method is useful if you want to setup a number of options (tracing,
      * conistency level, ...) of the returned statement before executing it manually
      * or need access to the {@code ResultSet} object after execution (to get the
      * trace, the execution info, ...), but in other cases, calling {@link #delete}
      * or {@link #deleteAsync} is shorter.
+     * This method allows you to provide a suite of {@link Option} to include in
+     * the DELETE query. Options currently supported for DELETE are :
+     * <ul>
+     * <li>Timestamp</li>
+     * <li>Consistency level</li>
+     * <li>Tracing</li>
+     * </ul>
      *
-     * @param args the primary key of the entity to delete, or more precisely
-     *             the values for the columns of said primary key in the order of the primary key.
-     *             Can be followed by {@link Option} to include in the DELETE
-     *             query.
+     * @param objects the primary key of the entity to delete, or more precisely
+     *                the values for the columns of said primary key in the order of the primary key.
+     *                Can be followed by {@link Option} to include in the DELETE
+     *                query.
      * @return a query that delete the entity of PRIMARY KEY {@code primaryKey}.
      * @throws IllegalArgumentException if the number of value provided differ from
      *                                  the number of columns composing the PRIMARY KEY of the mapped class, or if
      *                                  at least one of those values is {@code null}.
      */
-    public Statement deleteQuery(Object... args) {
+    public Statement deleteQuery(Object... objects) {
+        // Order and duplicates matter for primary keys
         List<Object> pks = new ArrayList<Object>();
-        List<Option> options = new ArrayList<Option>();
-        for (Object o : args) {
+        Set<Option> options = new HashSet<Option>();
+        for (Object o : objects) {
             if (o instanceof Option) {
                 options.add((Option)o);
             } else {
                 pks.add(o);
             }
         }
-        return deleteQuery(pks.toArray(), options);
+        return deleteQuery(pks, options);
     }
 
-    private Statement deleteQuery(Object[] primaryKey, List<Option> options) {
-        if (primaryKey.length != mapper.primaryKeySize())
-            throw new IllegalArgumentException(String.format("Invalid number of PRIMARY KEY columns provided, %d expected but got %d", mapper.primaryKeySize(), primaryKey.length));
+    private Statement deleteQuery(List<Object> primaryKey, Set<Option> options) {
+        if (primaryKey.size() != mapper.primaryKeySize())
+            throw new IllegalArgumentException(String.format("Invalid number of PRIMARY KEY columns provided, %d expected but got %d", mapper.primaryKeySize(), primaryKey.size()));
 
-        PreparedStatement ps;
-        if (options.size() != 0){
-            ps = getPreparedQuery(QueryType.DEL, options.toArray(new Option[options.size()]));
-        }
-        else {
-            ps = getPreparedQuery(QueryType.DEL, this.defaultDeleteOptions);
+        Set<Option> toUseOptions;
+        if (options.size() != 0) {
+            toUseOptions = options;
+        } else {
+            toUseOptions = this.defaultDeleteOptions;
         }
 
-        BoundStatement bs = ps.bind();
+        BoundStatement bs = getPreparedQuery(QueryType.DEL, toUseOptions).bind();
         int i = 0;
-        for (Option opt : options) {
-            if (opt.isValidFor(QueryType.DEL)) {
-                opt.bindInStatement(bs, i++);
-            }
+        for (Option opt : toUseOptions) {
+            if (opt.isValidFor(QueryType.DEL))
+                opt.addToPreparedStatement(bs, i);
+            if (opt.isIncludedInQuery())
+                i++;
         }
-        for (; i < primaryKey.length; i++) {
-            ColumnMapper<T> column = mapper.getPrimaryKeyColumn(i);
-            Object value = primaryKey[i];
+
+        int columnNumber = 0;
+        for (Object value : primaryKey) {
+            ColumnMapper<T> column = mapper.getPrimaryKeyColumn(columnNumber);
             if (value == null) {
                 throw new IllegalArgumentException(String.format("Invalid null value for PRIMARY KEY column %s (argument %d)", column.getColumnName(), i));
             }
-            bs.setBytesUnsafe(i, column.getDataType().serialize(value, protocolVersion));
+            bs.setBytesUnsafe(i++, column.getDataType().serialize(value, protocolVersion));
+            columnNumber++;
         }
 
         if (mapper.writeConsistency != null)
@@ -339,7 +497,7 @@ public class Mapper<T> {
 
     /**
      * Deletes an entity mapped by this mapper.
-     * <p>
+     * <p/>
      * This method is basically equivalent to: {@code getManager().getSession().execute(deleteQuery(entity))}.
      *
      * @param entity the entity to delete.
@@ -349,11 +507,12 @@ public class Mapper<T> {
     }
 
     /**
-     * Deletes an entity mapped by this mapper.
-     * <p>
+     * Deletes an entity mapped by this mapper using provided options.
+     * <p/>
      * This method is basically equivalent to: {@code getManager().getSession().execute(deleteQuery(entity, options))}.
      *
-     * @param entity the entity to delete.
+     * @param entity  the entity to delete.
+     * @param options the options to add to the DELETE query.
      */
     public void delete(T entity, Option... options) {
         session().execute(deleteQuery(entity, options));
@@ -361,7 +520,7 @@ public class Mapper<T> {
 
     /**
      * Deletes an entity mapped by this mapper asynchronously.
-     * <p>
+     * <p/>
      * This method is basically equivalent to: {@code getManager().getSession().executeAsync(deleteQuery(entity))}.
      *
      * @param entity the entity to delete.
@@ -372,11 +531,12 @@ public class Mapper<T> {
     }
 
     /**
-     * Deletes an entity mapped by this mapper asynchronously.
-     * <p>
+     * Deletes an entity mapped by this mapper asynchronously using provided options.
+     * <p/>
      * This method is basically equivalent to: {@code getManager().getSession().executeAsync(deleteQuery(entity, options))}.
      *
-     * @param entity the entity to delete.
+     * @param entity  the entity to delete.
+     * @param options the options to add to the DELETE query.
      * @return a future on the completion of the deletion.
      */
     public ListenableFuture<Void> deleteAsync(T entity, Option... options) {
@@ -385,7 +545,7 @@ public class Mapper<T> {
 
     /**
      * Deletes an entity based on its primary key.
-     * <p>
+     * <p/>
      * This method is basically equivalent to: {@code getManager().getSession().execute(deleteQuery(objects))}.
      *
      * @param objects the primary key of the entity to delete, or more precisely
@@ -402,12 +562,12 @@ public class Mapper<T> {
 
     /**
      * Deletes an entity based on its primary key asynchronously.
-     * <p>
+     * <p/>
      * This method is basically equivalent to: {@code getManager().getSession().executeAsync(deleteQuery(objects))}.
      *
      * @param objects the primary key of the entity to delete, or more precisely
      *                the values for the columns of said primary key in the order
-     *                of the primary key.Can be followed by {@link Option} to include
+     *                of the primary key. Can be followed by {@link Option} to include
      *                in the DELETE query.
      * @throws IllegalArgumentException if the number of value provided differ from
      *                                  the number of columns composing the PRIMARY KEY of the mapped class, or if
@@ -431,92 +591,40 @@ public class Mapper<T> {
     }
 
     /**
-     * Creates a query to fetch entity given its PRIMARY KEY.
-     * <p>
-     * The values provided must correspond to the columns composing the PRIMARY
-     * KEY (in the order of said primary key).
-     * <p>
-     * This method is useful if you want to setup a number of options (tracing,
-     * conistency level, ...) of the returned statement before executing it manually,
-     * but in other cases, calling {@link #get} or {@link #getAsync} is shorter.
-     *
-     * @param primaryKey the primary key of the entity to fetch, or more precisely
-     *                   the values for the columns of said primary key in the order of the primary key.
-     * @return a query that fetch the entity of PRIMARY KEY {@code primaryKey}.
-     * @throws IllegalArgumentException if the number of value provided differ from
-     *                                  the number of columns composing the PRIMARY KEY of the mapped class, or if
-     *                                  at least one of those values is {@code null}.
-     */
-    public Statement getQuery(Object... primaryKey) {
-        if (primaryKey.length != mapper.primaryKeySize())
-            throw new IllegalArgumentException(String.format("Invalid number of PRIMARY KEY columns provided, %d expected but got %d", mapper.primaryKeySize(), primaryKey.length));
-
-        PreparedStatement ps = getPreparedQuery(QueryType.GET);
-
-        BoundStatement bs = ps.bind();
-        for (int i = 0; i < primaryKey.length; i++) {
-            ColumnMapper<T> column = mapper.getPrimaryKeyColumn(i);
-            Object value = primaryKey[i];
-            if (value == null)
-                throw new IllegalArgumentException(String.format("Invalid null value for PRIMARY KEY column %s (argument %d)", column.getColumnName(), i));
-            bs.setBytesUnsafe(i, column.getDataType().serialize(value, protocolVersion));
-        }
-
-        if (mapper.readConsistency != null)
-            bs.setConsistencyLevel(mapper.readConsistency);
-        return bs;
-    }
-
-    /**
-     * Fetch an entity based on its primary key.
-     * <p>
-     * This method is basically equivalent to: {@code map(getManager().getSession().execute(getQuery(primaryKey))).one()}.
-     *
-     * @param primaryKey the primary key of the entity to fetch, or more precisely
-     *                   the values for the columns of said primary key in the order of the primary key.
-     * @return the entity fetched or {@code null} if it doesn't exist.
-     * @throws IllegalArgumentException if the number of value provided differ from
-     *                                  the number of columns composing the PRIMARY KEY of the mapped class, or if
-     *                                  at least one of those values is {@code null}.
-     */
-    public T get(Object... primaryKey) {
-        return map(session().execute(getQuery(primaryKey))).one();
-    }
-
-    /**
-     * Fetch an entity based on its primary key asynchronously.
-     * <p>
-     * This method is basically equivalent to mapping the result of: {@code getManager().getSession().executeAsync(getQuery(primaryKey))}.
-     *
-     * @param primaryKey the primary key of the entity to fetch, or more precisely
-     *                   the values for the columns of said primary key in the order of the primary key.
-     * @return a future on the fetched entity. The return future will yield
-     * {@code null} if said entity doesn't exist.
-     * @throws IllegalArgumentException if the number of value provided differ from
-     *                                  the number of columns composing the PRIMARY KEY of the mapped class, or if
-     *                                  at least one of those values is {@code null}.
-     */
-    public ListenableFuture<T> getAsync(Object... primaryKey) {
-        return Futures.transform(session().executeAsync(getQuery(primaryKey)), mapOneFunction);
-    }
-
-    /**
      * Set the default save {@link Option} for this object mapper, that will be used
      * in all save operations. Refer to {@link Mapper#save)} with Option argument
      * to check available save options.
      *
-     * @param options the options to set. To reset, use {@link Mapper#resetDefaultSaveOptions}
-     *                instead of putting null argument here.
+     * @param options the options to set. To reset, use {@link Mapper#resetDefaultSaveOptions}.
      */
     public void setDefaultSaveOptions(Option... options) {
-        this.defaultSaveOptions = Arrays.copyOf(options, options.length);
+        this.defaultSaveOptions = ImmutableSet.<Option>copyOf(options);
     }
 
     /**
      * Reset the default save options for this object mapper.
      */
     public void resetDefaultSaveOptions() {
-        this.defaultSaveOptions = null;
+        this.defaultSaveOptions = Collections.<Option>emptySet();
+    }
+
+    /**
+     * Set the default get {@link Option} for this object mapper, that will be used
+     * in all get operations. Refer to {@link Mapper#get)} with Option argument
+     * to check available get options.
+     *
+     * @param options the options to set. To reset, use {@link Mapper#resetDefaultGetOptions}.
+     */
+    public void setDefaultGetOptions(Option... options) {
+        this.defaultGetOptions = ImmutableSet.<Option>copyOf(options);
+
+    }
+
+    /**
+     * Reset the default save options for this object mapper.
+     */
+    public void resetDefaultGetOptions() {
+        this.defaultGetOptions = Collections.<Option>emptySet();
     }
 
     /**
@@ -528,29 +636,88 @@ public class Mapper<T> {
      *                instead of putting null argument here.
      */
     public void setDefaultDeleteOptions(Option... options) {
-        this.defaultDeleteOptions = Arrays.copyOf(options, options.length);
+        this.defaultDeleteOptions = ImmutableSet.<Option>copyOf(options);
     }
 
     /**
      * Reset the default delete options for this object mapper.
      */
     public void resetDefaultDeleteOptions() {
-        this.defaultDeleteOptions = null;
+        this.defaultDeleteOptions = Collections.<Option>emptySet();
     }
 
     /**
      * An object to allow defining specific options during a
      * {@link Mapper#save(Object)} or {@link Mapper#delete(Object...)} operation.
-     * <p>
+     * <p/>
      * The options will be added as : 'INSERT [...] USING option-name option-value [AND option-name option value... ].
      */
     public static abstract class Option {
+
+        enum Type {TTL, TIMESTAMP, CL, TRACING}
+
+        Type type;
+
+        /**
+         * Creates a new Option object to add a TTL value in a mapper operation.
+         *
+         * @param value the value to use for the operation.
+         * @return the Option object configured to set a TTL value to a
+         * mapper operation.
+         */
+        public static Option ttl(int value) {
+            return new Ttl(value);
+        }
+
+        /**
+         * Creates a new Option object to add a TIMESTAMP value in a mapper operation.
+         *
+         * @param value the value to use for the operation.
+         * @return the Option object configured to set a TIMESTAMP value to a
+         * mapper operation.
+         */
+        public static Option timestamp(long value) {
+            return new Timestamp(value);
+        }
+
+        /**
+         * Creates a new Option object to add a Consistency level value in a mapper operation.
+         *
+         * @param value the {@link com.datastax.driver.core.ConsistencyLevel} to use for the operation.
+         * @return the Option object configured to set a Consistency level value to a
+         * mapper operation.
+         */
+        public static Option consistencyLevel(ConsistencyLevel value) {
+            return new ConsistencyLevelOption(value);
+        }
+
+        /**
+         * Creates a new Option object to set Tracing flag in a mapper operation.
+         *
+         * @param value true to set tracing on, false otherwise.
+         * @return the Option object configured to add the tracing flag to a
+         * mapper operation.
+         */
+        public static Option tracing(boolean value) {
+            return new Tracing(value);
+        }
+
+        abstract void appendTo(Insert.Options usings);
+
+        abstract void appendTo(Delete.Options usings);
+
+        abstract void addToPreparedStatement(BoundStatement bs, int i);
+
+        abstract boolean isValidFor(QueryType qt);
+
+        abstract boolean isIncludedInQuery();
 
         static class Ttl extends Option {
 
             private int ttlValue;
 
             Ttl(int value) {
+                this.type = Type.TTL;
                 this.ttlValue = value;
             }
 
@@ -571,12 +738,16 @@ public class Mapper<T> {
                 usings.and(QueryBuilder.ttl(QueryBuilder.bindMarker()));
             }
 
-            void bindInStatement(BoundStatement bs, int i) {
+            void addToPreparedStatement(BoundStatement bs, int i) {
                 bs.setInt(i, this.ttlValue);
             }
 
-            boolean isValidFor(QueryType qt){
+            boolean isValidFor(QueryType qt) {
                 return qt == QueryType.SAVE;
+            }
+
+            boolean isIncludedInQuery() {
+                return true;
             }
 
         }
@@ -586,6 +757,7 @@ public class Mapper<T> {
             private long tsValue;
 
             Timestamp(long value) {
+                this.type = Type.TIMESTAMP;
                 this.tsValue = value;
             }
 
@@ -598,7 +770,7 @@ public class Mapper<T> {
                 return this.tsValue;
             }
 
-            void appendTo(Insert.Options usings){
+            void appendTo(Insert.Options usings) {
                 usings.and(QueryBuilder.timestamp(QueryBuilder.bindMarker()));
             }
 
@@ -606,51 +778,103 @@ public class Mapper<T> {
                 usings.and(QueryBuilder.timestamp(QueryBuilder.bindMarker()));
             }
 
-
-            boolean isValidFor(QueryType qt){
+            boolean isValidFor(QueryType qt) {
                 return qt == QueryType.SAVE || qt == QueryType.DEL;
             }
 
-            void bindInStatement(BoundStatement bs, int i){
+            void addToPreparedStatement(BoundStatement bs, int i) {
                 bs.setLong(i, this.tsValue);
+            }
+
+            boolean isIncludedInQuery() {
+                return true;
             }
 
         }
 
-        /**
-         * Creates a new SaveOptions object for adding a TTL value in a save
-         * or delete operation.
-         *
-         * @param value the value to use for the operation.
-         * @return the SaveOptions object configured to set a TTL value to a
-         * save or delete operation.
-         */
-        public static Option ttl(int value) {
-            return new Ttl(value);
+        static class ConsistencyLevelOption extends Option {
+
+            private ConsistencyLevel cl;
+
+            ConsistencyLevelOption(ConsistencyLevel cl) {
+                this.type = Type.CL;
+                this.cl = cl;
+            }
+
+            /**
+             * Get the Consistency level value configured in the object.
+             *
+             * @return the Consistency level value.
+             */
+            public ConsistencyLevel getValue() {
+                return this.cl;
+            }
+
+            // Shouldn't be called
+            void appendTo(Insert.Options usings) {
+            }
+
+            // Shouldn't be called
+            void appendTo(Delete.Options usings) {
+            }
+
+            void addToPreparedStatement(BoundStatement bs, int i) {
+                bs.setConsistencyLevel(cl);
+            }
+
+            boolean isValidFor(QueryType qt) {
+                return qt == QueryType.SAVE
+                    || qt == QueryType.DEL
+                    || qt == QueryType.GET;
+            }
+
+            boolean isIncludedInQuery() {
+                return false;
+            }
+
         }
 
-        /**
-         * Creates a new SaveOptions object for adding a TIMESTAMP value in a save
-         * or delete operation.
-         *
-         * @param value the value to use for the operation.
-         * @return the SaveOptions object configured to set a TIMESTAMP value to a
-         * save or delete operation.
-         */
-        public static Option timestamp(long value) {
-            return new Timestamp(value);
-        }
+        static class Tracing extends Option {
 
-        abstract void appendTo(Insert.Options usings);
+            private boolean tracing;
 
-        abstract void appendTo(Delete.Options usings);
+            Tracing(boolean tracing) {
+                this.type = Type.TRACING;
+                this.tracing = tracing;
+            }
 
-        abstract void bindInStatement(BoundStatement bs, int i);
+            /**
+             * Get the tracing value configured in the object.
+             *
+             * @return the tracing value.
+             */
+            public boolean getValue() {
+                return this.tracing;
+            }
 
-        abstract boolean isValidFor(QueryType qt);
+            // Shouldn't be called
+            void appendTo(Insert.Options usings) {
+            }
 
-        public int hashCode() {
-            return this.getClass().hashCode();
+            // Shouldn't be called
+            void appendTo(Delete.Options usings) {
+            }
+
+            void addToPreparedStatement(BoundStatement bs, int i) {
+                if (this.tracing)
+                    bs.enableTracing();
+            }
+
+            boolean isValidFor(QueryType qt) {
+                return qt == QueryType.SAVE
+                    || qt == QueryType.DEL
+                    || qt == QueryType.GET;
+            }
+
+            boolean isIncludedInQuery() {
+                return false;
+            }
+
         }
 
     }
@@ -658,11 +882,14 @@ public class Mapper<T> {
     private class MapperQueryKey {
         private int key;
 
-        MapperQueryKey(QueryType qt, Option... options) {
+        MapperQueryKey(QueryType qt, Set<Option> options) {
             this.key = qt.hashCode();
-            if (options != null) {
-                this.key += ImmutableList.copyOf(options).hashCode();
+            Set<Option.Type> optionsSet = new HashSet<Option.Type>();
+            for (Option opt : options) {
+                if (opt.isIncludedInQuery())
+                    optionsSet.add(opt.type);
             }
+            this.key += optionsSet.hashCode();
         }
 
         private int getKey() {
@@ -676,7 +903,7 @@ public class Mapper<T> {
             if ((obj == null) || (obj.getClass() != this.getClass())) {
                 return false;
             }
-            MapperQueryKey keyObj = (MapperQueryKey) obj;
+            MapperQueryKey keyObj = (MapperQueryKey)obj;
             return keyObj.getKey() == getKey();
 
         }

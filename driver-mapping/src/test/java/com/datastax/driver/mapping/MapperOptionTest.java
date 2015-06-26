@@ -25,6 +25,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.datastax.driver.core.BoundStatement;
 import com.datastax.driver.core.CCMBridge;
+import com.datastax.driver.core.ConsistencyLevel;
 import com.datastax.driver.mapping.annotations.PartitionKey;
 import com.datastax.driver.mapping.annotations.Table;
 
@@ -42,7 +43,7 @@ public class MapperOptionTest extends CCMBridge.PerClassSingleNodeCluster {
     void should_use_using_options_to_save() {
         Long tsValue = 906L;
         Mapper<User> mapper = new MappingManager(session).mapper(User.class);
-        mapper.saveAsync(new User(42, "helloworld"), Option.timestamp(tsValue));
+        mapper.saveAsync(new User(42, "helloworld"), Option.timestamp(tsValue), Option.tracing(true));
         assertThat(mapper.get(42).getV()).isEqualTo("helloworld");
         Long tsReturned = session.execute("SELECT writetime(v) FROM user WHERE key=" + 42).one().getLong(0);
         assertThat(tsReturned).isEqualTo(tsValue);
@@ -68,12 +69,23 @@ public class MapperOptionTest extends CCMBridge.PerClassSingleNodeCluster {
         mapper.resetDefaultSaveOptions();
         bs = (BoundStatement)mapper.saveQuery(new User(47, "rjhrgce"));
         assertThat(bs.preparedStatement().getQueryString()).doesNotContain("USING TIMESTAMP");
-        mapper.setDefaultDeleteOptions(Option.timestamp(3245L));
+        mapper.setDefaultDeleteOptions(Option.timestamp(3245L), Option.tracing(true));
         bs = (BoundStatement)mapper.deleteQuery(47);
         assertThat(bs.preparedStatement().getQueryString()).contains("USING TIMESTAMP");
+        assertThat(bs.isTracing()).isTrue();
         mapper.resetDefaultDeleteOptions();
         bs = (BoundStatement)mapper.deleteQuery(47);
         assertThat(bs.preparedStatement().getQueryString()).doesNotContain("USING TIMESTAMP");
+        bs = (BoundStatement)mapper.saveQuery(new User(46, "rjhrgce"), Option.timestamp(23), Option.consistencyLevel(ConsistencyLevel.ANY));
+        assertThat(bs.getConsistencyLevel()).isEqualTo(ConsistencyLevel.ANY);
+        mapper.setDefaultGetOptions(Option.tracing(true));
+        bs = (BoundStatement)mapper.getQuery(46);
+        assertThat(bs.isTracing()).isTrue();
+        mapper.resetDefaultGetOptions();
+        bs = (BoundStatement)mapper.getQuery(46);
+        // This is depends on the default behaviour of the driver.
+        // Currently by default tracing turned off.
+        assertThat(bs.isTracing()).isFalse();
     }
 
     @Test(groups = "short")
@@ -82,8 +94,21 @@ public class MapperOptionTest extends CCMBridge.PerClassSingleNodeCluster {
         User todelete = new User(45, "todelete");
         mapper.save(todelete);
         Option opt = Option.timestamp(35);
-        BoundStatement bs = (BoundStatement)mapper.deleteQuery(45, opt);
+        BoundStatement bs = (BoundStatement)mapper.deleteQuery(45, opt, Option.consistencyLevel(ConsistencyLevel.ALL));
         assertThat(bs.preparedStatement().getQueryString()).contains("USING TIMESTAMP");
+    }
+
+    @Test(groups = "short", expectedExceptions = {UnsupportedOperationException.class})
+    void should_use_using_options_to_get() {
+        Mapper<User> mapper = new MappingManager(session).mapper(User.class);
+        User todelete = new User(45, "toget");
+        mapper.save(todelete);
+        Option opt = Option.tracing(true);
+        BoundStatement bs = (BoundStatement)mapper.getQuery(45, opt);
+        assertThat(bs.isTracing()).isTrue();
+        User us = mapper.map(session.execute(bs)).one();
+        assertThat(us.getV()).isEqualTo("toget");
+        bs = (BoundStatement)mapper.getQuery(45, Option.timestamp(1337));
     }
 
     @Table(name = "user")

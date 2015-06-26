@@ -17,6 +17,7 @@ package com.datastax.driver.mapping;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 import com.google.common.base.Objects;
 
@@ -60,7 +61,7 @@ class QueryType {
         return new QueryType(reversed ? Kind.REVERSED_SLICE : Kind.SLICE, startBoundSize, startInclusive, endBoundSize, endInclusive);
     }
 
-    String makePreparedQueryString(TableMetadata table, EntityMapper<?> mapper, Mapper.Option... options) {
+    String makePreparedQueryString(TableMetadata table, EntityMapper<?> mapper, Set<Mapper.Option> options) {
         switch (kind) {
             case SAVE: {
                 Insert insert = table == null
@@ -68,14 +69,13 @@ class QueryType {
                     : insertInto(table);
                 for (ColumnMapper<?> cm : mapper.allColumns())
                     insert.value(cm.getColumnName(), bindMarker());
-                if (options != null) {
-                    Insert.Options usings = insert.using();
-                    for (Mapper.Option opt : options) {
-                        if (opt.isValidFor(QueryType.SAVE))
+                Insert.Options usings = insert.using();
+                for (Mapper.Option opt : options) {
+                    if (opt.isValidFor(QueryType.SAVE)) {
+                        if (opt.isIncludedInQuery())
                             opt.appendTo(usings);
-                        else
-                            throw new UnsupportedOperationException(String.format("Cannot use %s in this type of query : %s", opt.getClass().getName(), QueryType.SAVE));
-                    }
+                    } else
+                        throw new UnsupportedOperationException(String.format("Cannot use %s in this type of query : %s", opt.getClass().getName(), QueryType.SAVE));
                 }
                 return insert.toString();
             }
@@ -86,6 +86,11 @@ class QueryType {
                 Select.Where where = select.where();
                 for (int i = 0; i < mapper.primaryKeySize(); i++)
                     where.and(eq(mapper.getPrimaryKeyColumn(i).getColumnName(), bindMarker()));
+                for (Mapper.Option opt : options) {
+                    if (!opt.isValidFor(QueryType.GET)) {
+                        throw new UnsupportedOperationException(String.format("Cannot use %s in this type of query : %s", opt.getClass().getName(), QueryType.DEL));
+                    }
+                }
                 return select.toString();
             }
             case DEL: {
@@ -96,12 +101,12 @@ class QueryType {
                 for (int i = 0; i < mapper.primaryKeySize(); i++)
                     where.and(eq(mapper.getPrimaryKeyColumn(i).getColumnName(), bindMarker()));
                 Delete.Options usings = delete.using();
-                if (options != null){
-                    for (Mapper.Option opt : options){
-                        if(opt.isValidFor(QueryType.DEL))
+                for (Mapper.Option opt : options) {
+                    if (opt.isValidFor(QueryType.DEL)) {
+                        if (opt.isIncludedInQuery())
                             opt.appendTo(usings);
-                        else
-                            throw new UnsupportedOperationException(String.format("Cannot use %s in this type of query : %s", opt.getClass().getName(), QueryType.DEL));
+                    } else {
+                        throw new UnsupportedOperationException(String.format("Cannot use %s in this type of query : %s", opt.getClass().getName(), QueryType.DEL));
                     }
                 }
                 return delete.toString();
